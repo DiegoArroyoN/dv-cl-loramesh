@@ -1,0 +1,348 @@
+/* SPDX-License-Identifier: GPL-2.0-only */
+
+#include "ns3/double.h"
+#include "ns3/dv-cl-metric.h"
+#include "ns3/dv-cl-toa.h"
+#include "ns3/boolean.h"
+#include "ns3/test.h"
+
+namespace ns3
+{
+namespace dvcl
+{
+namespace test
+{
+
+class DvClToaGoldenTestCase : public TestCase
+{
+  public:
+    DvClToaGoldenTestCase()
+        : TestCase("dv-cl ToA matches Semtech AN1200.13 golden values")
+    {
+    }
+
+  private:
+    void DoRun() override
+    {
+        struct Row
+        {
+            uint8_t sf;
+            uint32_t bw;
+            uint8_t cr;
+            uint32_t pl;
+            bool de;
+            uint32_t expectedUs;
+        };
+
+        // From test/reference/toa_golden.csv (explicit header, CRC on).
+        const Row rows[] = {
+            {7, 125000, 1, 20, false, 56576},
+            {7, 125000, 1, 51, false, 102656},
+            {7, 250000, 1, 51, false, 51328},
+            {8, 125000, 1, 51, false, 184832},
+            {9, 125000, 1, 51, false, 328704},
+            {10, 125000, 1, 51, false, 616448},
+            {11, 125000, 1, 51, true, 1314816},
+            {12, 125000, 1, 51, true, 2465792},
+            {12, 125000, 4, 51, true, 3547136},
+            {7, 125000, 1, 1, false, 25856},
+            {12, 125000, 1, 222, true, 8036352},
+            {10, 125000, 2, 128, false, 1443840},
+        };
+        for (const auto& r : rows)
+        {
+            const uint32_t got = ComputeToaUs(r.sf, r.bw, r.cr, r.pl, false, r.de, true, 8);
+            NS_TEST_ASSERT_MSG_EQ(got,
+                                  r.expectedUs,
+                                  "ToA mismatch at SF" << unsigned(r.sf) << " BW" << r.bw << " CR"
+                                                       << unsigned(r.cr) << " PL" << r.pl << " DE"
+                                                       << r.de);
+        }
+    }
+};
+
+class DvClMetricAnalyticTestCase : public TestCase
+{
+  public:
+    DvClMetricAnalyticTestCase()
+        : TestCase("dv-cl composite metric analytic values and monotonicity")
+    {
+    }
+
+  private:
+    static LinkInputs In(double toaUs, uint8_t sf, double e)
+    {
+        LinkInputs in;
+        in.toaUs = toaUs;
+        in.sf = sf;
+        in.energyFraction = e;
+        return in;
+    }
+
+    void DoRun() override
+    {
+        auto m = CreateObject<DvClCompositeMetric>();
+        m->SetAttribute("ToaNormGlobal", BooleanValue(false));
+        const double tol = 1e-9;
+
+        // Full battery, ToA at the SF7 ceiling: 0.60*1 + 0.15 + 0 = 0.75.
+        NS_TEST_ASSERT_MSG_EQ_TOL(m->ComputeLinkCost(In(143360.0, 7, 1.0)),
+                                  0.75,
+                                  tol,
+                                  "toaNorm=1, no penalty");
+
+        // Zero ToA, boundary and interior battery values.
+        NS_TEST_ASSERT_MSG_EQ_TOL(m->ComputeLinkCost(In(0.0, 7, 0.50)), 0.15, tol, "b=bHi: Psi=0");
+        // b=0.35: Psi=((0.5-0.35)/0.3)^2=0.25 -> 0.25*0.25=0.0625.
+        NS_TEST_ASSERT_MSG_EQ_TOL(m->ComputeLinkCost(In(0.0, 7, 0.35)),
+                                  0.2125,
+                                  tol,
+                                  "b=0.35 interior ramp");
+        NS_TEST_ASSERT_MSG_EQ_TOL(m->ComputeLinkCost(In(0.0, 7, 0.20)),
+                                  0.40,
+                                  tol,
+                                  "b=bLo: full penalty 0.25");
+        NS_TEST_ASSERT_MSG_EQ_TOL(m->ComputeLinkCost(In(0.0, 7, 0.05)),
+                                  0.40,
+                                  tol,
+                                  "b<bLo saturates");
+        // Unknown charge (<0) prices as full battery.
+        NS_TEST_ASSERT_MSG_EQ_TOL(m->ComputeLinkCost(In(0.0, 7, -1.0)),
+                                  0.15,
+                                  tol,
+                                  "unknown charge: no penalty");
+
+        // Monotonicity in battery (lower b, higher cost).
+        const double c45 = m->ComputeLinkCost(In(0.0, 7, 0.45));
+        const double c30 = m->ComputeLinkCost(In(0.0, 7, 0.30));
+        const double c15 = m->ComputeLinkCost(In(0.0, 7, 0.15));
+        NS_TEST_ASSERT_MSG_GT(c30, c45, "penalty grows as b drops (0.30 vs 0.45)");
+        NS_TEST_ASSERT_MSG_GT(c15, c30, "penalty grows as b drops (0.15 vs 0.30)");
+
+        const double half = m->ComputeLinkCost(In(143360.0 / 2.0, 7, 1.0));
+        const double full = m->ComputeLinkCost(In(143360.0, 7, 1.0));
+        NS_TEST_ASSERT_MSG_GT(full, half, "cost grows with ToA");
+
+        // ToA normalization caps at 1 above the ceiling.
+        NS_TEST_ASSERT_MSG_EQ_TOL(m->ComputeLinkCost(In(10.0 * 143360.0, 7, 1.0)),
+                                  0.75,
+                                  tol,
+                                  "toaNorm capped at 1");
+
+        // Attribute plumbing: delta=0 disables the energy term.
+        m->SetAttribute("WEnergy", DoubleValue(0.0));
+        NS_TEST_ASSERT_MSG_EQ_TOL(m->ComputeLinkCost(In(0.0, 7, 0.05)),
+                                  0.15,
+                                  tol,
+                                  "WEnergy=0 removes penalty");
+    }
+};
+
+/**
+ * \ingroup dv-cl
+ * The dv-cl test suite, runnable with ./test.py -s dv-cl.
+ */
+class DvClThesisPsiTestCase : public TestCase
+{
+  public:
+    DvClThesisPsiTestCase()
+        : TestCase("dv-cl metric: Psi(b) matches Eq. (psi) of the thesis")
+    {
+    }
+
+  private:
+    void DoRun() override
+    {
+        auto metric = CreateObject<DvClCompositeMetric>();
+        metric->SetAttribute("ToaNormGlobal", BooleanValue(false));
+        const double delta = 0.25; // WEnergy default; EnergyPenalty folds it in
+
+        // b >= b_hi: no penalty at all. This is what makes a fully charged
+        // network indistinguishable from a ToA-only metric.
+        NS_TEST_ASSERT_MSG_EQ_TOL(metric->EnergyPenalty(1.00), 0.0, 1e-12, "b=1.00");
+        NS_TEST_ASSERT_MSG_EQ_TOL(metric->EnergyPenalty(0.97), 0.0, 1e-12, "b=0.97");
+        NS_TEST_ASSERT_MSG_EQ_TOL(metric->EnergyPenalty(0.50), 0.0, 1e-12, "at b_hi");
+
+        // b <= b_lo: saturated at Psi_max.
+        NS_TEST_ASSERT_MSG_EQ_TOL(metric->EnergyPenalty(0.20), delta, 1e-12, "at b_lo");
+        NS_TEST_ASSERT_MSG_EQ_TOL(metric->EnergyPenalty(0.05), delta, 1e-12, "below b_lo");
+        NS_TEST_ASSERT_MSG_EQ_TOL(metric->EnergyPenalty(0.00), delta, 1e-12, "empty");
+
+        // Between the thresholds: the quadratic ramp, checked at points whose
+        // value is exact. ((0.5-b)/0.3)^2 at b=0.35 is 0.25, at b=0.20+0.3/2.
+        NS_TEST_ASSERT_MSG_EQ_TOL(metric->EnergyPenalty(0.35), delta * 0.25, 1e-12, "midpoint");
+        NS_TEST_ASSERT_MSG_EQ_TOL(metric->EnergyPenalty(0.40),
+                                  delta * (1.0 / 9.0),
+                                  1e-12,
+                                  "b=0.40 -> (1/3)^2");
+        NS_TEST_ASSERT_MSG_EQ_TOL(metric->EnergyPenalty(0.30),
+                                  delta * (4.0 / 9.0),
+                                  1e-12,
+                                  "b=0.30 -> (2/3)^2");
+
+        // The ramp is monotone decreasing in charge, as a penalty must be.
+        double prev = metric->EnergyPenalty(0.20);
+        for (double b = 0.22; b <= 0.50; b += 0.02)
+        {
+            const double cur = metric->EnergyPenalty(b);
+            NS_TEST_ASSERT_MSG_LT_OR_EQ(cur, prev, "penalty must not rise with charge");
+            prev = cur;
+        }
+    }
+};
+
+class DvClThesisWeightsTestCase : public TestCase
+{
+  public:
+    DvClThesisWeightsTestCase()
+        : TestCase("dv-cl metric: alpha, beta and delta are the thesis weights")
+    {
+    }
+
+  private:
+    void DoRun() override
+    {
+        auto m = CreateObject<DvClCompositeMetric>();
+        m->SetAttribute("ToaNormGlobal", BooleanValue(false));
+        DoubleValue v;
+
+        m->GetAttribute("WToa", v);
+        NS_TEST_ASSERT_MSG_EQ_TOL(v.Get(), 0.60, 1e-12, "alpha");
+        m->GetAttribute("WHop", v);
+        NS_TEST_ASSERT_MSG_EQ_TOL(v.Get(), 0.15, 1e-12, "beta");
+        m->GetAttribute("WEnergy", v);
+        NS_TEST_ASSERT_MSG_EQ_TOL(v.Get(), 0.25, 1e-12, "delta");
+
+        // The three terms together, on inputs whose value is exact: half the
+        // SF7 ToA ceiling, and a charge at b_lo so Psi saturates at 1.
+        //   0.60*0.5 + 0.15 + 0.25*1 = 0.70
+        LinkInputs in;
+        in.toaUs = 143360.0 / 2.0;
+        in.sf = 7;
+        in.energyFraction = 0.20;
+        NS_TEST_ASSERT_MSG_EQ_TOL(m->ComputeLinkCost(in), 0.70, 1e-12, "alpha+beta+delta");
+
+        // Same link on a healthy battery: the energy term vanishes entirely.
+        //   0.60*0.5 + 0.15 = 0.45
+        in.energyFraction = 0.90;
+        NS_TEST_ASSERT_MSG_EQ_TOL(m->ComputeLinkCost(in), 0.45, 1e-12, "well charged");
+    }
+};
+
+class DvClRssiMetricTestCase : public TestCase
+{
+  public:
+    DvClRssiMetricTestCase()
+        : TestCase("dv-cl metric: RSSI baseline prices links by signal weakness")
+    {
+    }
+
+  private:
+    static LinkInputs Rx(double rssiDbm)
+    {
+        LinkInputs in;
+        in.rssiDbm = rssiDbm;
+        return in;
+    }
+
+    void DoRun() override
+    {
+        auto m = CreateObject<DvClRssiMetric>();
+        const double hop = 0.05; // default Hop
+        const double tol = 1e-12;
+
+        // A perfect link (ref = -30 dBm): weakness 0, cost = hop only.
+        NS_TEST_ASSERT_MSG_EQ_TOL(m->ComputeLinkCost(Rx(-30.0)), hop, tol, "perfect link");
+        // At the floor (-137 dBm): weakness 1, cost = wRssi*1 + hop = 1.05.
+        NS_TEST_ASSERT_MSG_EQ_TOL(m->ComputeLinkCost(Rx(-137.0)), 1.0 + hop, tol, "floor link");
+        // Halfway (-83.5 dBm): weakness 0.5.
+        NS_TEST_ASSERT_MSG_EQ_TOL(m->ComputeLinkCost(Rx(-83.5)), 0.5 + hop, tol, "mid link");
+
+        // Monotone: weaker (more negative) RSSI costs strictly more.
+        NS_TEST_ASSERT_MSG_GT(m->ComputeLinkCost(Rx(-100.0)),
+                              m->ComputeLinkCost(Rx(-60.0)),
+                              "weaker link costs more");
+
+        // Unmeasured (rssi == 0) charges the middling weakness, not 0.
+        NS_TEST_ASSERT_MSG_EQ_TOL(m->ComputeLinkCost(Rx(0.0)), 0.5 + hop, tol, "unmeasured");
+
+        // Beyond the band it clamps, never goes negative or above the ceiling.
+        NS_TEST_ASSERT_MSG_EQ_TOL(m->ComputeLinkCost(Rx(-10.0)), hop, tol, "stronger than ref clamps");
+        NS_TEST_ASSERT_MSG_GT(m->ComputeLinkCost(Rx(-200.0)), 0.0, "cost always positive");
+
+        Ptr<DvClRoutingMetric> asBase = m;
+        NS_TEST_ASSERT_MSG_NE(asBase, nullptr, "usable through the metric seam");
+    }
+};
+
+class DvClToaGlobalNormTestCase : public TestCase
+{
+  public:
+    DvClToaGlobalNormTestCase()
+        : TestCase("dv-cl metric: la normalizacion global de ToA distingue SF y no satura")
+    {
+    }
+
+  private:
+    void DoRun() override
+    {
+        auto m = CreateObject<DvClCompositeMetric>();
+        BooleanValue global;
+        m->GetAttribute("ToaNormGlobal", global);
+        NS_TEST_ASSERT_MSG_EQ(global.Get(), true, "el modo global es el defecto");
+
+        // Airtime de un dato de 27 B (20 de carga + 7 de cabecera), preambulo 16.
+        const double toaSf7 = 75008.0;
+        const double toaSf12 = 1908736.0;
+
+        const double n7 = m->NormalizeToa(toaSf7, 7);
+        const double n12 = m->NormalizeToa(toaSf12, 12);
+
+        // Ninguno satura con trafico realista: ese era el defecto.
+        NS_TEST_ASSERT_MSG_LT(n7, 1.0, "SF7 no satura");
+        NS_TEST_ASSERT_MSG_LT(n12, 1.0, "SF12 no satura");
+
+        // Y distingue: SF12 debe costar mucho mas aire que SF7.
+        NS_TEST_ASSERT_MSG_GT(n12 / n7, 10.0, "SF12 cuesta al menos 10x el aire de SF7");
+
+        // El coste compuesto hereda esa separacion (bateria sana, Psi=0).
+        LinkInputs a;
+        a.toaUs = toaSf7;
+        a.sf = 7;
+        a.energyFraction = 1.0;
+        LinkInputs b = a;
+        b.toaUs = toaSf12;
+        b.sf = 12;
+        NS_TEST_ASSERT_MSG_GT(m->ComputeLinkCost(b),
+                              m->ComputeLinkCost(a),
+                              "un enlace a SF12 cuesta mas que uno a SF7");
+
+        // Contraste con el modo por-SF: ahi la separacion se pierde.
+        m->SetAttribute("ToaNormGlobal", BooleanValue(false));
+        const double p7 = m->NormalizeToa(toaSf7, 7);
+        const double p12 = m->NormalizeToa(toaSf12, 12);
+        NS_TEST_ASSERT_MSG_LT(p12 / p7, 2.0,
+                              "por-SF los dos SF quedan a menos de 2x: no discrimina");
+    }
+};
+
+class DvClTestSuite : public TestSuite
+{
+  public:
+    DvClTestSuite()
+        : TestSuite("dv-cl", Type::UNIT)
+    {
+        AddTestCase(new DvClToaGoldenTestCase, TestCase::Duration::QUICK);
+        AddTestCase(new DvClMetricAnalyticTestCase, TestCase::Duration::QUICK);
+        AddTestCase(new DvClThesisPsiTestCase, TestCase::Duration::QUICK);
+        AddTestCase(new DvClThesisWeightsTestCase, TestCase::Duration::QUICK);
+        AddTestCase(new DvClRssiMetricTestCase, TestCase::Duration::QUICK);
+        AddTestCase(new DvClToaGlobalNormTestCase, TestCase::Duration::QUICK);
+    }
+};
+
+static DvClTestSuite g_dvClTestSuite; //!< static suite registration
+
+} // namespace test
+} // namespace dvcl
+} // namespace ns3

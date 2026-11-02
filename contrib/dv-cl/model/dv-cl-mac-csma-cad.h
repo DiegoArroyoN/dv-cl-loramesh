@@ -1,0 +1,178 @@
+/* SPDX-License-Identifier: GPL-2.0-only */
+
+#ifndef DV_CL_MAC_CSMA_CAD_H
+#define DV_CL_MAC_CSMA_CAD_H
+
+#include "dv-cl-regional-profile.h"
+
+#include "ns3/nstime.h"
+#include "ns3/object.h"
+#include "ns3/ptr.h"
+#include "ns3/random-variable-stream.h"
+
+#include <cstdint>
+#include <deque>
+#include <string>
+
+namespace ns3
+{
+namespace lorawan
+{
+class LoraPhy;
+}
+
+namespace dvcl
+{
+
+/**
+ * \brief Minimal CSMA/CAD MAC helper handling channel sampling, backoff and duty cycle.
+ */
+class DvClCsmaCadMac : public Object
+{
+  public:
+    enum CadDecisionModel : uint8_t
+    {
+        CAD_ORACLE = 0,
+        CAD_LOCAL_POWER = 1,
+    };
+
+    enum CadDurationMode : uint8_t
+    {
+        CAD_DURATION_FIXED = 0,
+        CAD_DURATION_SF_BW = 1,
+    };
+
+    static TypeId GetTypeId();
+    DvClCsmaCadMac();
+    ~DvClCsmaCadMac() override = default;
+
+    /// Duty enforcement discipline; see the DutyEnforcement attribute.
+    enum class DutyEnforcement
+    {
+        TIME_OFF_AIR,   //!< ETSI EN 300 220 / LoRaWAN: silence proportional to airtime
+        SLIDING_WINDOW,
+        FIXED_WINDOW,   //!< clock-aligned allowance that refills when the window rolls over
+    };
+
+    /// Transmissions that consumed air without a same-instant gate grant.
+    uint64_t GetUngatedTxCount() const
+    {
+        return m_ungatedTx;
+    }
+
+    /// Transmissions that were authorised at the instant they went on air.
+    uint64_t GetGatedTxCount() const
+    {
+        return m_gatedTx;
+    }
+
+    /**
+     * rief Install the region whose rules this MAC obeys.
+     *
+     * Sets the duty cycle from the region and makes its dwell cap
+     * effective. Without one the MAC keeps its own attributes, which is
+     * the EU868 behaviour it has always had.
+     */
+    void SetRegionalProfile(Ptr<DvClRegionalProfile> region);
+
+  private:
+    void RollFixedWindow();
+
+  public:
+    Ptr<DvClRegionalProfile> GetRegionalProfile() const { return m_region; }
+
+    void SetDutyEnforcement(const std::string& mode);
+    std::string GetDutyEnforcement() const;
+
+    bool CanTransmitNow();
+    bool CanTransmitNow(double toaSeconds);
+    void NotifyTxStart(double toaSeconds);
+    void NotifyRxStart(double durationSeconds);
+    uint32_t GetBackoffSlots();
+    double GetDutyCycleUsed();
+    double GetDutyCycleLimit() const;
+    void SetDutyCycleLimit(double limit);
+    void SetDutyCycleWindow(Time window);
+    Time GetDutyCycleWindow() const;
+    void SetCadDuration(Time duration);
+    void SetDifsCadCount(uint8_t count);
+    void SetMaxBackoffSlots(uint32_t slots);
+    uint32_t GetMaxBackoffSlots() const;
+    void SetMaxBackoffSlotsAbs(uint32_t slots);
+    uint32_t GetMaxBackoffSlotsAbs() const;
+    void SetRandomStream(Ptr<UniformRandomVariable> rng);
+    void SetPhy(Ptr<lorawan::LoraPhy> phy);
+    void SetCadContext(uint8_t sf, uint32_t bwHz);
+    void UpdateTypicalDataToaSeconds(double toaSeconds);
+    void UpdateTypicalCtrlToaSeconds(double toaSeconds);
+    void NotifyTxResult(bool success);
+    uint32_t GetFailureCount() const;
+    uint32_t GetLastBackoffSlots() const;
+    uint32_t GetLastBackoffWindowSlots() const;
+    double GetCadLoadEstimate() const;
+    uint64_t GetCadBusyEventsLocalPower() const;
+    uint64_t GetCadBusyEventsOracle() const;
+
+    Time GetCadDuration() const;
+    uint8_t GetDifsCadCount() const;
+    bool PerformChannelAssessment();
+
+  private:
+    bool PerformCadOnce(Time sampleTime);
+    void CleanOldTxHistory();
+    void RecordCadResult(bool busy);
+    double GetCadLoad() const;
+    uint32_t ComputeBackoffWindowSlots() const;
+    uint32_t ComputeMaxBackoffSlots() const;
+    void UpdateToaEma(double& emaSeconds, double toaSeconds);
+    Time ComputeCadDurationFromContext() const;
+    double GetCadSensitivityDbm(uint8_t sf) const;
+
+    static constexpr uint32_t kDefaultMaxBackoffSlots = 64;
+    static constexpr uint32_t kDefaultMaxBackoffSlotsAbs = 128;
+
+    Ptr<UniformRandomVariable> m_rng;
+    Ptr<lorawan::LoraPhy> m_phy;
+    Time m_dutyCycleWindow;
+    double m_dutyCycleLimit;
+    Time m_cadDuration;
+    uint8_t m_difsCadCount;
+    std::deque<std::pair<Time, Time>> m_txHistory;
+    std::deque<bool> m_cadHistory;
+    uint32_t m_cadHistoryWindow;
+    uint32_t m_minBackoffSlots;
+    uint32_t m_maxBackoffSlots;
+    uint32_t m_maxBackoffSlotsAbs;
+    uint32_t m_backoffStep;
+    uint32_t m_failures;
+    uint32_t m_lastBackoffSlots;
+    uint32_t m_lastBackoffWindowSlots;
+    double m_loadWeight;
+    double m_toaEmaDataSeconds;
+    double m_toaEmaCtrlSeconds;
+    double m_toaEmaAlpha;
+    double m_toaMaxFactor;
+    bool m_dutyCycleEnabled;
+    DutyEnforcement m_dutyEnforcement{DutyEnforcement::TIME_OFF_AIR};
+    Time m_nextTxAllowed{Seconds(0)}; //!< time-off-air gate: earliest next TX
+    Ptr<DvClRegionalProfile> m_region; //!< regional rules; null = MAC attributes alone
+    int64_t m_fixedWindowIndex{-1};
+    double m_fixedWindowSpent{0.0};
+    Time m_lastGrantAt{Seconds(-1)};
+    double m_lastGrantToa{0.0};
+    uint64_t m_ungatedTx{0};
+    uint64_t m_gatedTx{0};
+    CadDecisionModel m_cadDecisionModel;
+    CadDurationMode m_cadDurationMode;
+    uint8_t m_cadSymbols;
+    uint8_t m_cadSf;
+    uint32_t m_cadBandwidthHz;
+    double m_cadSenseMarginDb;
+    uint64_t m_cadBusyEventsLocalPower;
+    uint64_t m_cadBusyEventsOracle;
+};
+
+} // namespace dvcl
+} // namespace ns3
+
+#endif /* DV_CL_MAC_CSMA_CAD_H */
