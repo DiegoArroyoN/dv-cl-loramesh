@@ -70,6 +70,15 @@ Las simulaciones de carga liviana usan ambas opciones en su valor por defecto.
 Los experimentos de condiciones de los capítulos 5 y 8 provienen del artículo
 para *Ad Hoc Networks* y no se incluyen aquí.
 
+## Versiones
+
+- `v1.1`: la transmisión y la recepción activan la optimización para baja tasa
+  de datos (LDRO) según el SF de la trama, como exige LoRa en SF11 y SF12 con
+  125 kHz. Con SF7 a SF10 las simulaciones son idénticas a las de `v1.0`. Es la
+  versión con que se ejecutaron las simulaciones con SF7–SF12 de los
+  experimentos de cadencia, presupuesto energético y prevención de bucles.
+- `v1.0`: versión inicial.
+
 ## Licencia
 
 GPL-2.0-only, como ns-3. Ver `LICENSE`.

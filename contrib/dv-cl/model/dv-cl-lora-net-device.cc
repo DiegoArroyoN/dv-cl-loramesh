@@ -339,6 +339,9 @@ DvClLoraNetDevice::Send(Ptr<Packet> packet, const Address& dest, uint16_t protoc
         // Fallback: usar SF por defecto del nodo si no viene tag
         txParams.sf = 9;
     }
+    // LDRO según el SF de la trama (obligatorio en SF11 y SF12 con 125 kHz).
+    txParams.lowDataRateOptimizationEnabled =
+        LowDataRateOptimizationRequired(txParams.sf, txParams.bandwidthHz);
 
     NS_LOG_INFO("Node " << GetNode()->GetId() << " SENDING to " << dest << ": pkt_size="
                         << txPacket->GetSize() << " freq=868MHz, power=" << txPowerDbm << "dBm, SF"
@@ -486,6 +489,8 @@ DvClLoraNetDevice::Receive(Ptr<const Packet> packet)
             rxParams.crcEnabled = true;
             rxParams.headerDisabled = false;
             rxParams.nPreamble = m_preambleSymbols;
+            rxParams.lowDataRateOptimizationEnabled =
+                LowDataRateOptimizationRequired(rxParams.sf, rxParams.bandwidthHz);
             Time airTime = lorawan::LoraPhy::GetOnAirTime(pktCopy, rxParams);
             duration = airTime.GetSeconds();
         }
